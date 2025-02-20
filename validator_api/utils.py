@@ -1,19 +1,23 @@
-import httpx
+import random
+
 import requests
 from loguru import logger
 
+from shared import settings
 from shared.loop_runner import AsyncLoopRunner
-from shared.settings import shared_settings
 from shared.uids import get_uids
 
 
 class UpdateMinerAvailabilitiesForAPI(AsyncLoopRunner):
+    interval: int = 300
     miner_availabilities: dict[int, dict] = {}
 
     async def run_step(self):
+        if settings.shared_settings.API_TEST_MODE:
+            return
         try:
             response = requests.post(
-                f"http://{shared_settings.VALIDATOR_API}/miner_availabilities/miner_availabilities",
+                f"http://{settings.shared_settings.VALIDATOR_API}/miner_availabilities/miner_availabilities",
                 headers={"accept": "application/json", "Content-Type": "application/json"},
                 json=get_uids(sampling_mode="all"),
                 timeout=10,
@@ -26,26 +30,37 @@ class UpdateMinerAvailabilitiesForAPI(AsyncLoopRunner):
         logger.debug(
             f"MINER AVAILABILITIES UPDATED, TRACKED: {len(tracked_availabilities)}, UNTRACKED: {len(self.miner_availabilities) - len(tracked_availabilities)}"
         )
+        logger.debug(f"SAMPLE AVAILABILITIES: {random.choice(list(self.miner_availabilities.values()))}")
 
 
 update_miner_availabilities_for_api = UpdateMinerAvailabilitiesForAPI()
 
 
-def filter_available_uids(task: str | None = None, model: str | None = None) -> list[int]:
-    """
-    Filter UIDs based on task and model availability.
+def filter_available_uids(
+    task: str | None = None,
+    model: str | None = None,
+    test: bool = False,
+    n_miners: int = 10,
+    n_top_incentive: int = 100,
+) -> list[int]:
+    """Filter UIDs based on task and model availability.
 
     Args:
-        uids: List of UIDs to filter
-        task: Task type to check availability for, or None if any task is acceptable
-        model: Model name to check availability for, or None if any model is acceptable
+        task (str | None, optional): The task to filter miners by. Defaults to None.
+        model (str | None, optional): The LLM model to filter miners by. Defaults to None.
+        test (bool, optional): Whether to run in test mode. Defaults to False.
+        n_miners (int, optional): Number of miners to return. Defaults to 10.
+        n_top_incentive (int, optional): Number of top incentivized miners to consider. Defaults to 10.
 
     Returns:
-        List of UIDs that can serve the requested task/model combination
+        list[int]: List of filtered UIDs that match the criteria.
     """
+    if test:
+        return get_uids(sampling_mode="top_incentive", k=n_miners)
+
     filtered_uids = []
 
-    for uid in get_uids(sampling_mode="all"):
+    for uid in get_uids(sampling_mode="top_incentive", k=max(n_top_incentive, n_miners)):
         # Skip if miner data is None/unavailable
         if update_miner_availabilities_for_api.miner_availabilities.get(str(uid)) is None:
             continue
@@ -64,36 +79,10 @@ def filter_available_uids(task: str | None = None, model: str | None = None) -> 
 
         filtered_uids.append(uid)
 
+    if len(filtered_uids) == 0:
+        logger.error("Got empty list of available UIDs. Check VALIDATOR_API and SCORING_KEY in .env.api")
+        return filtered_uids
+
+    filtered_uids = random.sample(filtered_uids, min(len(filtered_uids), n_miners))
+
     return filtered_uids
-
-
-# TODO: Modify this so that all the forwarded responses are sent in a single request. This is both more efficient but
-# also means that on the validator side all responses are scored at once, speeding up the scoring process.
-async def forward_response(uids: list[int], body: dict[str, any], chunks: list[list[str]]):
-    uids = [int(u) for u in uids]
-    chunk_dict = {u: c for u, c in zip(uids, chunks)}
-    logger.info(f"Forwarding response from uid {uids} to scoring with body: {body} and chunks: {chunks}")
-    if not shared_settings.SCORE_ORGANICS:
-        return
-
-    if body.get("task") != "InferenceTask" and body.get("task") != "WebRetrievalTask":
-        logger.debug(f"Skipping forwarding for non- inference/web retrieval task: {body.get('task')}")
-        return
-
-    url = f"http://{shared_settings.VALIDATOR_API}/scoring"
-    payload = {"body": body, "chunks": chunk_dict, "uid": uids}
-    try:
-        timeout = httpx.Timeout(timeout=120.0, connect=60.0, read=30.0, write=30.0, pool=5.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                url, json=payload, headers={"api-key": shared_settings.SCORING_KEY, "Content-Type": "application/json"}
-            )
-            if response.status_code == 200:
-                logger.info(f"Forwarding response completed with status {response.status_code}")
-            else:
-                logger.exception(
-                    f"Forwarding response uid {uids} failed with status {response.status_code} and payload {payload}"
-                )
-    except Exception as e:
-        logger.error(f"Tried to forward response to {url} with payload {payload}")
-        logger.exception(f"Error while forwarding response: {e}")

@@ -4,7 +4,9 @@ from typing import Literal
 import numpy as np
 from loguru import logger
 
-from shared.settings import shared_settings
+from shared import settings
+
+shared_settings = settings.shared_settings
 
 
 def check_uid_availability(
@@ -25,17 +27,11 @@ def check_uid_availability(
     metagraph = shared_settings.METAGRAPH
     # Filter non serving axons.
     if not metagraph.axons[uid].is_serving:
-        logger.debug(f"uid: {uid} is not serving")
+        # logger.debug(f"uid: {uid} is not serving")
         return False
 
     # Filter validator permit > 1024 stake.
     if metagraph.validator_permit[uid] and metagraph.S[uid] > shared_settings.NEURON_VPERMIT_TAO_LIMIT:
-        logger.debug(
-            f"uid: {uid} has vpermit and stake ({metagraph.S[uid]}) > {shared_settings.NEURON_VPERMIT_TAO_LIMIT}"
-        )
-        logger.debug(
-            f"uid: {uid} has vpermit and stake ({metagraph.S[uid]}) > {shared_settings.NEURON_VPERMIT_TAO_LIMIT}"
-        )
         return False
 
     if coldkeys and metagraph.axons[uid].coldkey in coldkeys:

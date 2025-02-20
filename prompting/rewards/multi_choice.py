@@ -3,7 +3,6 @@ import re
 import time
 
 import numpy as np
-from loguru import logger
 from pydantic import Field, model_validator
 
 from prompting.rewards.reward import BaseRewardModel, BatchRewardOutput
@@ -42,6 +41,9 @@ class MultiChoiceRewardModel(BaseRewardModel):
         }
 
         total = sum(valid_choices.values())
+        if np.isclose(total, 0.0):
+            raise ValueError(f"Values sum up to 0, total={total}")
+
         if not np.isclose(total, 1.0):
             valid_choices = {k: v / total for k, v in valid_choices.items()}
 
@@ -73,5 +75,4 @@ class MultiChoiceRewardModel(BaseRewardModel):
             timings.append(time.perf_counter() - start_time)
             rewards.append(reward)
 
-        logger.debug(f"Rewards: {rewards}")
         return BatchRewardOutput(rewards=np.asarray(rewards), timings=np.asarray(timings))

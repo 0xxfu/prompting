@@ -9,8 +9,8 @@ from pydantic import BaseModel, ConfigDict
 from prompting.llms.hf_llm import ReproducibleHF
 from prompting.llms.model_zoo import ModelConfig, ModelZoo
 from prompting.llms.utils import GPUInfo
+from shared import settings
 from shared.loop_runner import AsyncLoopRunner
-from shared.settings import shared_settings
 
 # This maintains a list of tasks for which we need to generate references. Since
 # we can only generate the references, when the correct model is loaded, we work
@@ -20,7 +20,7 @@ open_tasks = []
 
 class ModelManager(BaseModel):
     always_active_models: list[ModelConfig] = []
-    total_ram: float = shared_settings.LLM_MODEL_RAM
+    total_ram: float = settings.shared_settings.LLM_MODEL_RAM
     active_models: dict[ModelConfig, ReproducibleHF] = {}
     used_ram: float = 0.0
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -39,7 +39,6 @@ class ModelManager(BaseModel):
         if force:
             logger.debug(f"Forcing model {model_config.llm_model_id} to load.")
             for active_model in list(self.active_models.keys()):
-                logger.debug(f"Checking if model {active_model.llm_model_id} can be unloaded.")
                 if active_model in self.always_active_models:
                     logger.debug(f"Model {active_model.llm_model_id} is always active. Skipping.")
                     continue
@@ -63,15 +62,12 @@ class ModelManager(BaseModel):
             )
 
         try:
-            logger.debug(
-                f"Loading model... {model_config.llm_model_id} with GPU Utilization: {model_config.min_ram / GPUInfo.free_memory}"
-            )
             GPUInfo.log_gpu_info()
 
             model = ReproducibleHF(
                 model=model_config.llm_model_id,
                 gpu_memory_utilization=model_config.min_ram / GPUInfo.free_memory,
-                max_model_len=shared_settings.LLM_MAX_MODEL_LEN,
+                max_model_len=settings.shared_settings.LLM_MAX_MODEL_LEN,
             )
 
             self.active_models[model_config] = model

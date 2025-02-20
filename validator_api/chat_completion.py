@@ -2,16 +2,20 @@ import asyncio
 import json
 import math
 import random
+import time
 from typing import Any, AsyncGenerator, Callable, List, Optional
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from loguru import logger
 
+from shared import settings
+
+shared_settings = settings.shared_settings
+
 from shared.epistula import make_openai_query
-from shared.settings import shared_settings
-from shared.uids import get_uids
-from validator_api.utils import forward_response
+from validator_api import scoring_queue
+from validator_api.utils import filter_available_uids
 
 
 async def peek_until_valid_chunk(
@@ -86,9 +90,14 @@ async def peek_first_chunk(
 
 
 async def stream_from_first_response(
-    responses: List[asyncio.Task], collected_chunks_list: List[List[str]], body: dict[str, any], uids: List[int]
+    responses: List[asyncio.Task],
+    collected_chunks_list: List[List[str]],
+    body: dict[str, any],
+    uids: List[int],
+    timings_list: List[List[float]],
 ) -> AsyncGenerator[str, None]:
     first_valid_response = None
+    response_start_time = time.monotonic()
     try:
         # Keep looping until we find a valid response or run out of tasks
         while responses and first_valid_response is None:
@@ -130,6 +139,7 @@ async def stream_from_first_response(
                 continue
 
             chunks_received = True
+            timings_list[0].append(time.monotonic() - response_start_time)
             collected_chunks_list[0].append(content)
             yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
@@ -141,9 +151,22 @@ async def stream_from_first_response(
 
         # Continue collecting remaining responses in background for scoring
         remaining = asyncio.gather(*pending, return_exceptions=True)
-        remaining_tasks = asyncio.create_task(collect_remaining_responses(remaining, collected_chunks_list, body, uids))
+        remaining_tasks = asyncio.create_task(
+            collect_remaining_responses(
+                remaining=remaining,
+                collected_chunks_list=collected_chunks_list,
+                body=body,
+                uids=uids,
+                timings_list=timings_list,
+                response_start_time=response_start_time,
+            )
+        )
         await remaining_tasks
-        asyncio.create_task(forward_response(uids, body, collected_chunks_list))
+        asyncio.create_task(
+            scoring_queue.scoring_queue.append_response(
+                uids=uids, body=body, chunks=collected_chunks_list, timings=timings_list
+            )
+        )
 
     except asyncio.CancelledError:
         logger.info("Client disconnected, streaming cancelled")
@@ -156,12 +179,16 @@ async def stream_from_first_response(
 
 
 async def collect_remaining_responses(
-    remaining: asyncio.Task, collected_chunks_list: List[List[str]], body: dict[str, any], uids: List[int]
+    remaining: asyncio.Task,
+    collected_chunks_list: List[List[str]],
+    body: dict[str, any],
+    uids: List[int],
+    timings_list: List[List[float]],
+    response_start_time: float,
 ):
     """Collect remaining responses for scoring without blocking the main response."""
     try:
         responses = await remaining
-        logger.debug(f"responses to forward: {responses}")
         for i, response in enumerate(responses):
             if isinstance(response, Exception):
                 logger.error(f"Error collecting response from uid {uids[i+1]}: {response}")
@@ -173,6 +200,7 @@ async def collect_remaining_responses(
                 content = getattr(chunk.choices[0].delta, "content", None)
                 if content is None:
                     continue
+                timings_list[i + 1].append(time.monotonic() - response_start_time)
                 collected_chunks_list[i + 1].append(content)
 
     except Exception as e:
@@ -195,23 +223,30 @@ async def chat_completion(
     body: dict[str, any], uids: Optional[list[int]] = None, num_miners: int = 10
 ) -> tuple | StreamingResponse:
     """Handle chat completion with multiple miners in parallel."""
-    logger.debug(f"REQUEST_BODY: {body}")
-    # Get multiple UIDs if none specified
-    if uids is None:
-        uids = list(get_uids(sampling_mode="random", k=100))
-        if uids is None or len(uids) == 0:  # if not uids throws error, figure out how to fix
-            logger.error("No available miners found")
-            raise HTTPException(status_code=503, detail="No available miners found")
-        selected_uids = random.sample(uids, min(num_miners, len(uids)))
-    else:
-        selected_uids = uids[:num_miners]  # If UID is specified, only use that one
+    body["seed"] = int(body.get("seed") or random.randint(0, 1000000))
+    if not uids:
+        logger.debug(
+            "Finding miners for task: {} model: {} test: {} n_miners: {}",
+            body.get("task"),
+            body.get("model"),
+            shared_settings.API_TEST_MODE,
+            num_miners,
+        )
+        uids = body.get("uids") or filter_available_uids(
+            task=body.get("task"), model=body.get("model"), test=shared_settings.API_TEST_MODE, n_miners=num_miners
+        )
+        if not uids:
+            raise HTTPException(status_code=500, detail="No available miners")
+        uids = random.sample(uids, min(len(uids), num_miners))
 
-    logger.debug(f"Querying uids {selected_uids}")
     STREAM = body.get("stream", False)
 
     # Initialize chunks collection for each miner
-    collected_chunks_list = [[] for _ in selected_uids]
+    collected_chunks_list = [[] for _ in uids]
+    timings_list = [[] for _ in uids]
 
+    if not body.get("sampling_parameters"):
+        raise HTTPException(status_code=422, detail="Sampling parameters are required")
     timeout_seconds = max(
         30, max(0, math.floor(math.log2(body["sampling_parameters"].get("max_new_tokens", 256) / 256))) * 10 + 30
     )
@@ -223,11 +258,11 @@ async def chat_completion(
                     shared_settings.METAGRAPH, shared_settings.WALLET, timeout_seconds, body, uid, stream=True
                 )
             )
-            for uid in selected_uids
+            for uid in uids
         ]
 
         return StreamingResponse(
-            stream_from_first_response(response_tasks, collected_chunks_list, body, selected_uids),
+            stream_from_first_response(response_tasks, collected_chunks_list, body, uids, timings_list),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -238,7 +273,7 @@ async def chat_completion(
         # For non-streaming requests, wait for first valid response
         response_tasks = [
             asyncio.create_task(get_response_from_miner(body=body, uid=uid, timeout_seconds=timeout_seconds))
-            for uid in selected_uids
+            for uid in uids
         ]
 
         first_valid_response = None

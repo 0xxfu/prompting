@@ -51,7 +51,6 @@ class TaskScorer(AsyncLoopRunner):
                 task_id=task_id,
             )
         )
-        logger.debug(f"SCORING: Added to queue: {task.__class__.__name__}. Queue size: {len(self.scoring_queue)}")
 
     async def run_step(self) -> RewardLoggingEvent:
         await asyncio.sleep(0.1)
@@ -63,7 +62,6 @@ class TaskScorer(AsyncLoopRunner):
             or (scoring_config.task.llm_model is None)
         ]
         if len(scorable) == 0:
-            logger.debug("Nothing to score. Skipping scoring step.")
             # Run a model_scheduler step to load a new model as there are no more tasks to be scored
             if len(self.scoring_queue) > 0:
                 await model_scheduler.run_step()
@@ -72,15 +70,12 @@ class TaskScorer(AsyncLoopRunner):
         scoring_config: ScoringConfig = scorable.pop(0)
 
         # here we generate the actual reference
-        scoring_config.task.make_reference(
+        await scoring_config.task.make_reference(
             dataset_entry=scoring_config.dataset_entry,
         )
 
         # and there we then calculate the reward
         reward_pipeline = TaskRegistry.get_task_reward(scoring_config.task)
-        logger.debug(
-            f"""{len(scoring_config.response.completions)} completions to score for task {scoring_config.task}"""
-        )
         reward_events = reward_pipeline.apply(
             response_event=scoring_config.response,
             challenge=scoring_config.task.query,
@@ -89,27 +84,31 @@ class TaskScorer(AsyncLoopRunner):
             task=scoring_config.task,
         )
         self.reward_events.append(reward_events)
-        # logger.debug(
-        #     f"REFERENCE: {scoring_config.task.reference}\n\n||||RESPONSES: {scoring_config.response.completions}"
-        # )
+
+        # TODO: Remove this once we have a better way to handle organic tasks
+        if scoring_config.task.organic:
+            self.reward_events.append(
+                reward_events
+            )  # Add the organic a second time, doubling the weight of the organic
         logger.debug(
-            f"SCORING: Scored {scoring_config.task.__class__.__name__} {scoring_config.task.task_id} with model {scoring_config.task.llm_model_id} with reward"
+            f"Scored {scoring_config.task.__class__.__name__} {scoring_config.task.task_id} with model "
+            f"{scoring_config.task.llm_model_id}"
         )
-        log_event(
-            RewardLoggingEvent(
-                response_event=scoring_config.response,
-                reward_events=reward_events,
-                reference=scoring_config.task.reference,
-                challenge=scoring_config.task.query,
-                task=scoring_config.task.name,
-                block=scoring_config.block,
-                step=scoring_config.step,
-                task_id=scoring_config.task_id,
-                task_dict=scoring_config.task.model_dump(),
-                source=scoring_config.dataset_entry.source,
+        if not scoring_config.task.organic:
+            log_event(
+                RewardLoggingEvent(
+                    response_event=scoring_config.response,
+                    reward_events=reward_events,
+                    reference=scoring_config.task.reference,
+                    challenge=scoring_config.task.query,
+                    task=scoring_config.task.name,
+                    block=scoring_config.block,
+                    step=scoring_config.step,
+                    task_id=scoring_config.task_id,
+                    task_dict=scoring_config.task.model_dump(),
+                    source=scoring_config.dataset_entry.source,
+                )
             )
-        )
-        logger.info("Adding scores to rewards_and_uids")
         await asyncio.sleep(0.01)
 
 
