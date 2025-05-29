@@ -1,93 +1,153 @@
 import asyncio
-import multiprocessing as mp
+import atexit
+import os
+import signal
 import sys
+import time
+from multiprocessing.managers import AcquirerProxy
+from multiprocessing.synchronize import Event
 
-import loguru
 import netaddr
+import psutil
 import requests
 import torch
+import torch.multiprocessing as mp
 import wandb
 from bittensor.core.extrinsics.serving import serve_extrinsic
-
-from prompting.rewards.scoring import task_scorer
+from loguru import logger
 
 # ruff: noqa: E402
 from shared import settings
-from shared.logging import init_wandb
 
 settings.shared_settings = settings.SharedSettings.load(mode="validator")
+
+from prompting.llms.model_manager import AsyncModelScheduler, ModelManager
+from prompting.rewards.scoring import task_scorer
+from shared.logging import init_wandb
+
+
+def init_process_logging(name: str):
+    """Initialize logging for a new process."""
+    logger.remove()  # Remove any existing handlers
+    try:
+        # Add process-specific handlers
+        logger.add(
+            f"{name}_{os.getpid()}.log",
+            rotation="100 MB",
+            retention="10 days",
+            level="DEBUG",
+            enqueue=True,  # Use queue for thread-safe logging
+        )
+        logger.add(
+            f"{name}_err_{os.getpid()}.log", rotation="100 MB", retention="10 days", level="WARNING", enqueue=True
+        )
+        logger.add(sys.stderr, level=settings.shared_settings.LOG_LEVEL, enqueue=True)
+    except Exception as e:
+        print(f"Failed to initialize logging for process {os.getpid()}: {e}")
 
 
 from prompting.llms.utils import GPUInfo
 
-# Add a handler to write logs to a file
-loguru.logger.add("logfile.log", rotation="1000 MB", retention="10 days", level="DEBUG")
-from loguru import logger
+logger.remove()
+logger.add("logfile.log", rotation="100 MB", retention="10 days", level="DEBUG")
+logger.add("err.log", rotation="100 MB", retention="10 days", level="WARNING")
+logger.add(sys.stderr, level=settings.shared_settings.LOG_LEVEL)
 
 torch.multiprocessing.set_start_method("spawn", force=True)
 
-NEURON_SAMPLE_SIZE = 100  # TODO: Should add this to constants.py
 
-
-def create_loop_process(task_queue, scoring_queue, reward_events):
+async def create_loop_process(
+    model_scheduler: AsyncModelScheduler,
+    task_queue: list,
+    scoring_queue: list,
+    reward_events: list,
+    miners_dict: dict,
+    mp_lock: AcquirerProxy,
+):
+    # Load settings and initialize external services.
     settings.shared_settings = settings.SharedSettings.load(mode="validator")
     if settings.shared_settings.WANDB_ON:
         init_wandb(neuron="validator")
 
-    async def spawn_loops(task_queue, scoring_queue, reward_events):
-        # ruff: noqa: E402
-        from prompting.llms.model_manager import model_scheduler
-        from prompting.miner_availability.miner_availability import availability_checking_loop
+    all_tasks: list[asyncio.Task] = []
+
+    async def cleanup(model_scheduler):
+        logger.info("Cleaning up resources...")
+        torch.distributed.destroy_process_group()
+        await model_scheduler.llm_model.cleanup()
+        for t in all_tasks:
+            t.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+        if settings.shared_settings.WANDB_ON:
+            wandb.finish()
+            logger.info("WandB run finished.")
+
+    async def spawn_loops(task_queue: list, scoring_queue: list, reward_events: list, miners_dict: dict):
+        # Import modules that are local to this scope.
         from prompting.tasks.task_creation import task_loop
-        from prompting.tasks.task_sending import task_sender
-        from prompting.weight_setting.weight_setter import weight_setter
         from shared.profiling import profiler
 
-        logger.info("Starting Profiler...")
-        asyncio.create_task(profiler.print_stats(), name="Profiler"),
+        logger.info("Starting loops...")
+        profile = asyncio.create_task(profiler.print_stats(), name="Profiler")
+        task_loop_task = asyncio.create_task(
+            task_loop.start(task_queue, scoring_queue, miners_dict, simultaneous_loops=1), name="TaskLoop"
+        )
+        model_scheduler_task = asyncio.create_task(model_scheduler.start(scoring_queue), name="ModelScheduler")
+        task_scorer_task = asyncio.create_task(
+            task_scorer.start(
+                model_scheduler,
+                scoring_queue,
+                reward_events,
+                mp_lock=mp_lock,
+                task_queue=task_queue,
+                simultaneous_loops=1,
+            ),
+            name="TaskScorer",
+        )
+        all_tasks.extend([profile, task_loop_task, model_scheduler_task, task_scorer_task])
 
-        # -------- Duplicate of create_task_loop ----------
-        logger.info("Starting AvailabilityCheckingLoop...")
-        asyncio.create_task(availability_checking_loop.start())
+        try:
+            while True:
+                await asyncio.sleep(10)
+                logger.debug(
+                    f"Task Queue {len(task_queue)}. Scoring Queue {len(scoring_queue)}. Reward Events {len(reward_events)}"
+                )
+                if model_scheduler.memory_error is not None:
+                    raise model_scheduler.memory_error
+        except asyncio.CancelledError:
+            logger.info("spawn_loops received cancellation signal.")
+            raise
 
-        logger.info("Starting TaskSender...")
-        asyncio.create_task(task_sender.start(task_queue, scoring_queue))
-
-        logger.info("Starting TaskLoop...")
-        asyncio.create_task(task_loop.start(task_queue, scoring_queue))
-        # -------------------------------------------------
-
-        logger.info("Starting ModelScheduler...")
-        asyncio.create_task(model_scheduler.start(scoring_queue), name="ModelScheduler"),
-        logger.info("Starting TaskScorer...")
-        asyncio.create_task(task_scorer.start(scoring_queue, reward_events), name="TaskScorer"),
-        logger.info("Starting WeightSetter...")
-        asyncio.create_task(weight_setter.start(reward_events))
-
-        while True:
-            await asyncio.sleep(5)
-
-            # Check if all tasks are still running
-            logger.debug(f"Number of tasks in Task Queue: {len(task_queue)}")
-            logger.debug(f"Number of tasks in Scoring Queue: {len(scoring_queue)}")
-            logger.debug(f"Number of tasks in Reward Events: {len(reward_events)}")
-
-    asyncio.run(spawn_loops(task_queue, scoring_queue, reward_events))
+    try:
+        await spawn_loops(task_queue, scoring_queue, reward_events, miners_dict)
+    except MemoryError as e:
+        logger.error(f"MemoryError encountered. Terminating program: {e}")
+        await cleanup(model_scheduler)
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Terminating loop process: {e}")
+    finally:
+        await cleanup(model_scheduler)
 
 
-def start_api(scoring_queue, reward_events):
+def start_api(
+    scoring_queue: list,
+    reward_events: list,
+    miners_dict: dict,
+    event_stop: Event,
+    weight_dict: dict,
+):
+    init_process_logging(name="APIProcess")
+    from prompting.api.api import start_scoring_api
+
+    logger.info("Starting API process...")
+
     async def start():
-        from prompting.api.api import start_scoring_api  # noqa: F401
-
-        # TODO: We should not use 2 availability loops for each process, in reality
-        # we should only be sharing the miner availability data between processes.
-        from prompting.miner_availability.miner_availability import availability_checking_loop
-
-        asyncio.create_task(availability_checking_loop.start())
-
         try:
             external_ip = requests.get("https://checkip.amazonaws.com").text.strip()
             netaddr.IPAddress(external_ip)
+
+            logger.info(f"Serving on {external_ip}:{settings.shared_settings.SCORING_API_PORT}")
 
             serve_success = serve_extrinsic(
                 subtensor=settings.shared_settings.SUBTENSOR,
@@ -101,70 +161,239 @@ def start_api(scoring_queue, reward_events):
             logger.debug(f"Serve success: {serve_success}")
         except Exception as e:
             logger.warning(f"Failed to serve scoring api to chain: {e}")
-        await start_scoring_api(task_scorer, scoring_queue, reward_events)
+        logger.info("Starting scoring api")
+        await start_scoring_api(task_scorer, scoring_queue, reward_events, miners_dict, weight_dict)
 
-        while True:
+        while not event_stop.is_set():
             await asyncio.sleep(10)
 
     asyncio.run(start())
 
 
-async def main():
-    # will start checking the availability of miners at regular intervals, needed for API and Validator
-    with torch.multiprocessing.Manager() as manager:
-        reward_events = manager.list()
-        scoring_queue = manager.list()
-        task_queue = manager.list()
+def start_task_sending_loop(
+    task_queue: list,
+    scoring_queue: list,
+    miners_dict: dict,
+    event_stop: Event,
+):
+    init_process_logging(name="TaskSending")  # Initialize logging for task sending process
 
-        # Create process pool for managed processes
-        processes = []
+    async def spawn_loops(task_queue, scoring_queue, miners_dict: dict):
+        from prompting.tasks.task_sending import TaskSender
+
+        logger.info("Starting task sending loop in validator...")
+        task_sender = TaskSender()
+        asyncio.create_task(task_sender.start(task_queue, scoring_queue, miners_dict, simultaneous_loops=1))
+        logger.debug("Task sending loop started")
+
+        while not event_stop.is_set():
+            await asyncio.sleep(5)
+            logger.debug("Task sending loop is running")
+
+    try:
+        logger.info("Starting task sending loop in validator...")
+        asyncio.run(spawn_loops(task_queue, scoring_queue, miners_dict))
+
+    except Exception as e:
+        logger.exception(f"Task sending loop error: {e}")
+        raise
+
+
+def start_availability_checking_loop(miners_dict: dict, event_stop: Event):
+    init_process_logging(name="AvailabilityChecking")  # Initialize logging for availability checking process
+
+    async def spawn_loops(miners_dict: dict):
+        from prompting.miner_availability.miner_availability import availability_checking_loop
+
+        logger.info("Starting availability checking loop in validator...")
+        asyncio.create_task(availability_checking_loop.start(miners_dict))
+        while not event_stop.is_set():
+            await asyncio.sleep(5)
+            logger.debug("Availability checking loop is running")
+
+    try:
+        logger.info("Starting availability checking loop in validator...")
+        asyncio.run(spawn_loops(miners_dict))
+
+    except Exception as e:
+        logger.exception(f"Availability checking loop error: {e}")
+        raise
+
+
+def start_weight_setter_loop(reward_events, weight_dict, event_stop: Event):
+    init_process_logging(name="WeightSetter")  # Initialize logging for weight setter process
+
+    async def spawn_loops(reward_events, weight_dict):
+        from prompting.weight_setting.weight_setter import weight_setter
+
+        logger.info("Starting weight setter loop in validator...")
+        asyncio.create_task(weight_setter.start(reward_events, weight_dict, name="WeightSetter"))
+        while not event_stop.is_set():
+            await asyncio.sleep(5)
+            logger.debug("Weight setter loop is running")
+
+    try:
+        logger.info("Starting weight setter loop in validator...")
+        asyncio.run(spawn_loops(reward_events, weight_dict))
+
+    except Exception as e:
+        logger.exception(f"Weight setter loop error: {e}")
+        raise
+
+
+def health_check(parent_pid: int, event_stop: Event):
+    init_process_logging(name="HealthCheck")  # Initialize logging for health check process
+    """Monitor parent process and kill all child processes in case of emergency."""
+    step = 0
+    while True:
+        try:
+            if not psutil.pid_exists(parent_pid):
+                event_stop.set()
+                logger.warning("Parent process died, killing all child processes")
+                os.killpg(0, signal.SIGKILL)
+
+            block = settings.shared_settings.block
+            if block - settings.shared_settings.METAGRAPH.last_update[settings.shared_settings.UID] > 320 and step > 60:
+                event_stop.set()
+                last_update_block = settings.shared_settings.METAGRAPH.last_update[settings.shared_settings.UID]
+                logger.warning(
+                    f"Metagraph hasn't been updated for {block - last_update_block} blocks. "
+                    f"Staled block: {block}, Last update: {last_update_block}"
+                )
+                os.killpg(0, signal.SIGKILL)
+            step += 1
+
+        except Exception as e:
+            logger.error(f"Failed to kill process group: {e}")
+        finally:
+            sys.exit(1)
+        time.sleep(60)
+
+
+async def main(
+    cache_rewards: list | None = None,
+    cache_scores: list | None = None,
+    cache_tasks: list | None = None,
+    cache_miners: dict | None = None,
+    cache_weight_dict: dict | None = None,
+):
+    # will start checking the availability of miners at regular intervals, needed for API and Validator
+    with mp.Manager() as manager:
+        reward_events = manager.list(list(cache_rewards) if cache_rewards else [])
+        scoring_queue = manager.list(list(cache_scores) if cache_scores else [])
+        task_queue = manager.list(list(cache_tasks) if cache_tasks else [])
+        weight_dict = manager.dict(dict(cache_weight_dict) if cache_weight_dict else {})
+        miners_dict = manager.dict(dict(cache_miners) if cache_miners else {})
+        mp_lock = manager.Lock()
+        processes: list[mp.Process] = []
+        tasks: list[asyncio.Task] = []
+        event_stop = mp.Event()
+
+        model_scheduler = AsyncModelScheduler(llm_model_manager=ModelManager(), mp_lock=mp_lock, sync=True)
 
         try:
-            # # Start checking the availability of miners at regular intervals
-            if settings.shared_settings.DEPLOY_SCORING_API:
+            # Start checking the availability of miners at regular intervals
+            if not settings.shared_settings.NEURON_DISABLE_SET_WEIGHTS:
                 # Use multiprocessing to bypass API blocking issue
-                api_process = mp.Process(target=start_api, args=(scoring_queue, reward_events), name="API_Process")
+                api_process = mp.Process(
+                    target=start_api,
+                    args=(scoring_queue, reward_events, miners_dict, event_stop, weight_dict),
+                    name="APIProcess",
+                    daemon=True,
+                )
                 api_process.start()
                 processes.append(api_process)
 
-            loop_process = mp.Process(
-                target=create_loop_process, args=(task_queue, scoring_queue, reward_events), name="LoopProcess"
+            availability_process = mp.Process(
+                target=start_availability_checking_loop,
+                args=(miners_dict, event_stop),
+                name="AvailabilityProcess",
+                daemon=True,
             )
+            availability_process.start()
+            processes.append(availability_process)
 
-            loop_process.start()
-            processes.append(loop_process)
+            loop_task = asyncio.create_task(
+                create_loop_process(
+                    model_scheduler=model_scheduler,
+                    task_queue=task_queue,
+                    scoring_queue=scoring_queue,
+                    reward_events=reward_events,
+                    miners_dict=miners_dict,
+                    mp_lock=mp_lock,
+                )
+            )
+            tasks.append(loop_task)
+
+            sending_task = mp.Process(
+                target=start_task_sending_loop,
+                args=(task_queue, scoring_queue, miners_dict, event_stop),
+                name="SendingTaskProcess",
+                daemon=True,
+            )
+            sending_task.start()
+            processes.append(sending_task)
+
+            weight_setter_process = mp.Process(
+                target=start_weight_setter_loop,
+                args=(reward_events, weight_dict, event_stop),
+                name="WeightSetterProcess",
+                daemon=True,
+            )
+            weight_setter_process.start()
+            processes.append(weight_setter_process)
+
+            # health_check_process = mp.Process(
+            #     target=health_check,
+            #     args=(os.getpid(), event_stop),
+            #     name="HealthCheckProcess",
+            #     daemon=True,
+            # )
+            # health_check_process.start()
+            # processes.append(health_check_process)
+
             GPUInfo.log_gpu_info()
-
-            step = 0
             while True:
                 await asyncio.sleep(30)
-                if (
-                    settings.shared_settings.SUBTENSOR.get_current_block()
-                    - settings.shared_settings.METAGRAPH.last_update[settings.shared_settings.UID]
-                    > 500
-                    and step > 120
-                ):
-                    current_block = settings.shared_settings.SUBTENSOR.get_current_block()
-                    last_update_block = settings.shared_settings.METAGRAPH.last_update[settings.shared_settings.UID]
-                    logger.warning(
-                        f"Metagraph hasn't been updated for {current_block - last_update_block} blocks. "
-                        f"Staled block: {current_block}, Last update: {last_update_block}"
-                    )
-                    sys.exit(1)
-                step += 1
 
+        except KeyboardInterrupt:
+            event_stop.set()
+            logger.info("KeyboardInterrupt detected. Shutting down gracefully...")
         except Exception as e:
             logger.error(f"Main loop error: {e}")
             raise
         finally:
-            wandb.teardown()
-            # Clean up processes
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-                    process.join()
+            logger.warning("🚨 Force‑killing entire process‑group")
+
+            # 1. Cancel in‑process tasks so they stop touching the Manager.
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(5)
+
+            # 2. Manager cleanup *first* (so its socket vanishes).
+            manager.shutdown()
+
+            # 3. Sledgehammer.
+            try:
+                os.killpg(0, signal.SIGKILL)
+            except Exception as e:
+                logger.error(f"Failed to kill process group: {e}")
+    sys.exit(1)
+
+
+def kill_process_group():
+    try:
+        os.killpg(os.getpgid(0), signal.SIGKILL)
+    except Exception as e:
+        logger.error(f"Failed to kill process group: {e}")
 
 
 # The main function parses the configuration and runs the validator.
 if __name__ == "__main__":
+    try:
+        os.setpgrp()
+        atexit.register(kill_process_group)
+    except BaseException:
+        logger.warning("Failed to set process group; emergency termination may not work.")
     asyncio.run(main())

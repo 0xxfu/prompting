@@ -1,51 +1,109 @@
-import asyncio
-import json
 import random
-import time
-import uuid
+from datetime import timezone
 
-import numpy as np
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from loguru import logger
-from openai.types.chat.chat_completion_chunk import ChatCompletionChunk, Choice, ChoiceDelta
 from starlette.responses import StreamingResponse
 
 from shared import settings
 
 shared_settings = settings.shared_settings
-from shared.epistula import SynapseStreamResult, query_miners
-from validator_api import scoring_queue
-from validator_api.api_management import _keys
+from validator_api.api_management import validate_api_key
 from validator_api.chat_completion import chat_completion
+from validator_api.deep_research.orchestrator_v2 import OrchestratorV2
+from validator_api.job_store import job_store, process_chain_of_thought_job
 from validator_api.mixture_of_miners import mixture_of_miners
-from validator_api.test_time_inference import generate_response
+from validator_api.serializers import CompletionsRequest, JobResponse, JobResultResponse, TestTimeInferenceRequest
 from validator_api.utils import filter_available_uids
 
 router = APIRouter()
-N_MINERS = 5
 
 
-def validate_api_key(api_key: str = Header(...)):
-    if api_key not in _keys:
-        raise HTTPException(status_code=403, detail="Invalid API key")
-    return _keys[api_key]
+@router.post(
+    "/v1/chat/completions",
+    summary="Chat completions endpoint",
+    description="Main endpoint that handles both regular, multi step reasoning, test time inference, and mixture of miners chat completion.",
+    response_description="Streaming response with generated text",
+    status_code=status.HTTP_200_OK,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Successful response with streaming text",
+            "content": {"text/event-stream": {}},
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Internal server error or no available miners"},
+    },
+)
+async def completions(request: CompletionsRequest, api_key: str = Depends(validate_api_key)):
+    """
+    Chat completions endpoint that supports different inference modes.
 
+    This endpoint processes chat messages and returns generated completions using
+    different inference strategies based on the request parameters.
 
-@router.post("/v1/chat/completions")
-async def completions(request: Request, api_key: str = Depends(validate_api_key)):
-    """Main endpoint that handles both regular and mixture of miners chat completion."""
+    ## Inference Modes:
+    - Regular chat completion
+    - Multi Step Reasoning
+    - Test time inference
+    - Mixture of miners
+
+    ## Request Parameters:
+    - **uids** (List[int], optional): Specific miner UIDs to query. If not provided, miners will be selected automatically.
+    - **messages** (List[dict]): List of message objects with 'role' and 'content' keys. Required.
+    - **seed** (int, optional): Random seed for reproducible results.
+    - **task** (str, optional): Task identifier to filter available miners.
+    - **model** (str, optional): Model identifier to filter available miners.
+    - **test_time_inference** (bool, default=False): Enable step-by-step reasoning mode.
+    - **mixture** (bool, default=False): Enable mixture of miners mode.
+    - **sampling_parameters** (dict, optional): Parameters to control text generation.
+
+    The endpoint selects miners based on the provided UIDs or filters available miners
+    based on task and model requirements.
+
+    Example request:
+    ```json
+    {
+      "messages": [
+        {"role": "user", "content": "Tell me about neural networks"}
+      ],
+      "model": "gpt-4",
+      "seed": 42
+    }
+    ```
+    """
     try:
-        body = await request.json()
+        body = request.model_dump()
+        if body.get("inference_mode") == "Reasoning-Fast":
+            body["task"] = "MultiStepReasoningTask"
+        if body.get("model") == "Default":
+            # By setting default, we are allowing a user to use whatever model we define as the standard, could also set to None.
+            body["model"] = "mrfakename/mistral-small-3.1-24b-instruct-2503-hf"
         body["seed"] = int(body.get("seed") or random.randint(0, 1000000))
-        uids = body.get("uids") or filter_available_uids(
-            task=body.get("task"), model=body.get("model"), test=shared_settings.API_TEST_MODE, n_miners=N_MINERS
-        )
+        if body.get("uids"):
+            try:
+                uids = list(map(int, body.get("uids")))
+            except Exception:
+                logger.error(f"Error in uids: {body.get('uids')}")
+        else:
+            uids = filter_available_uids(
+                task=body.get("task"),
+                model=body.get("model"),
+                test=shared_settings.API_TEST_MODE,
+                n_miners=shared_settings.API_TOP_MINERS_TO_STREAM,
+                n_top_incentive=shared_settings.API_TOP_MINERS_SAMPLE,
+                explore=shared_settings.API_UIDS_EXPLORE,
+            )
         if not uids:
             raise HTTPException(status_code=500, detail="No available miners")
-        # Choose between regular completion and mixture of miners.
-        if body.get("test_time_inference", False):
-            return await test_time_inference(body["messages"], body.get("model", None))
-        if body.get("mixture", False):
+
+        if body.get("test_time_inference", False) or body.get("inference_mode", None) == "Chain-of-Thought":
+            test_time_request = TestTimeInferenceRequest(
+                messages=request.messages,
+                model=request.model,
+                uids=uids if uids else None,
+                json_format=request.json_format,
+            )
+            return await test_time_inference(test_time_request)
+        elif body.get("mixture", False) or body.get("inference_mode", None) == "Mixture-of-Agents":
             return await mixture_of_miners(body, uids=uids)
         else:
             return await chat_completion(body, uids=uids)
@@ -55,85 +113,208 @@ async def completions(request: Request, api_key: str = Depends(validate_api_key)
         return StreamingResponse(content="Internal Server Error", status_code=500)
 
 
-@router.post("/web_retrieval")
-async def web_retrieval(search_query: str, n_miners: int = 10, n_results: int = 5, max_response_time: int = 10):
-    uids = filter_available_uids(task="WebRetrievalTask", test=shared_settings.API_TEST_MODE, n_miners=n_miners)
-    if not uids:
-        raise HTTPException(status_code=500, detail="No available miners")
+async def test_time_inference(request: TestTimeInferenceRequest):
+    """
+    Test time inference endpoint that provides step-by-step reasoning.
 
-    uids = random.sample(uids, min(len(uids), n_miners))
-    if len(uids) == 0:
-        logger.warning("No available miners. This should already have been caught earlier.")
-        return
+    This endpoint streams the thinking process and reasoning steps during inference,
+    allowing visibility into how the model arrives at its conclusions. Each step of
+    the reasoning process is streamed as it becomes available.
 
-    body = {
-        "seed": random.randint(0, 1_000_000),
-        "sampling_parameters": shared_settings.SAMPLING_PARAMS,
-        "task": "WebRetrievalTask",
-        "target_results": n_results,
-        "timeout": max_response_time,
-        "messages": [
-            {"role": "user", "content": search_query},
-        ],
+    ## Request Parameters:
+    - **messages** (List[dict]): List of message objects with 'role' and 'content' keys. Required.
+    - **model** (str, optional): Optional model identifier to use for inference.
+    - **uids** (List[int], optional): Optional list of specific miner UIDs to query.
+
+    ## Response:
+    The response is streamed as server-sent events (SSE) with each step of reasoning.
+    Each event contains:
+    - A step title/heading
+    - The content of the reasoning step
+    - Timing information (debug only)
+
+    Example request:
+    ```json
+    {
+      "messages": [
+        {"role": "user", "content": "Solve the equation: 3x + 5 = 14"}
+      ],
+      "model": "gpt-4"
     }
+    ```
+    """
+    orchestrator = OrchestratorV2(completions=completions)
 
-    timeout_seconds = 30
-    stream_results = await query_miners(uids, body, timeout_seconds)
-    results = [
-        "".join(res.accumulated_chunks)
-        for res in stream_results
-        if isinstance(res, SynapseStreamResult) and res.accumulated_chunks
-    ]
-    distinct_results = list(np.unique(results))
-    loaded_results = []
-    for result in distinct_results:
-        try:
-            loaded_results.append(json.loads(result))
-            logger.info(f"🔍 Result: {result}")
-        except Exception:
-            logger.error(f"🔍 Result: {result}")
-    if len(loaded_results) == 0:
-        raise HTTPException(status_code=500, detail="No miner responded successfully")
-
-    collected_chunks_list = [res.accumulated_chunks if res and res.accumulated_chunks else [] for res in stream_results]
-    asyncio.create_task(scoring_queue.scoring_queue.append_response(uids=uids, body=body, chunks=collected_chunks_list))
-    return loaded_results
-
-
-@router.post("/test_time_inference")
-async def test_time_inference(messages: list[dict], model: str = None):
-    async def create_response_stream(messages):
-        async for steps, total_thinking_time in generate_response(messages, model=model):
-            if total_thinking_time is not None:
-                logger.debug(f"**Total thinking time: {total_thinking_time:.2f} seconds**")
-            yield steps, total_thinking_time
-
-    # Create a streaming response that yields each step
-    async def stream_steps():
-        try:
-            i = 0
-            async for steps, thinking_time in create_response_stream(messages):
-                i += 1
-                yield "data: " + ChatCompletionChunk(
-                    id=str(uuid.uuid4()),
-                    created=int(time.time()),
-                    model=model or "None",
-                    object="chat.completion.chunk",
-                    choices=[
-                        Choice(index=i, delta=ChoiceDelta(content=f"## {steps[-1][0]}\n\n{steps[-1][1]}" + "\n\n"))
-                    ],
-                ).model_dump_json() + "\n\n"
-        except Exception as e:
-            logger.exception(f"Error during streaming: {e}")
-            yield f'data: {{"error": "Internal Server Error: {str(e)}"}}\n\n'
-        finally:
-            yield "data: [DONE]\n\n"
+    async def create_response_stream(request):
+        async for chunk in orchestrator.run(messages=request.messages):
+            yield chunk
 
     return StreamingResponse(
-        stream_steps(),
+        create_response_stream(request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
         },
+    )
+
+
+@router.post(
+    "/v1/chat/completions/jobs",
+    summary="Asynchronous chat completions endpoint for Chain-of-Thought",
+    description="Submit a Chain-of-Thought inference job to be processed in the background and get a job ID immediately.",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        status.HTTP_202_ACCEPTED: {
+            "description": "Job accepted for processing",
+            "model": JobResponse,
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Internal server error or no available miners"},
+    },
+)
+async def submit_chain_of_thought_job(
+    request: CompletionsRequest, background_tasks: BackgroundTasks, api_key: str = Depends(validate_api_key)
+):
+    """Submit a Chain-of-Thought inference job to be processed in the background.
+
+    This endpoint accepts the same parameters as the /v1/chat/completions endpoint,
+    but instead of streaming the response, it submits the job to the background and
+    returns a job ID immediately. The job results can be retrieved using the
+    /v1/chat/completions/jobs/{job_id} endpoint.
+
+    ## Request Parameters:
+    - **uids** (List[int], optional): Specific miner UIDs to query. If not provided, miners will be selected automatically.
+    - **messages** (List[dict]): List of message objects with 'role' and 'content' keys. Required.
+    - **model** (str, optional): Model identifier to filter available miners.
+
+    ## Response:
+    - **job_id** (str): Unique identifier for the job.
+    - **status** (str): Current status of the job (pending, running, completed, failed).
+    - **created_at** (str): Timestamp when the job was created.
+    - **updated_at** (str): Timestamp when the job was last updated.
+
+    Example request:
+    ```json
+    {
+      "messages": [
+        {"role": "user", "content": "Solve the equation: 3x + 5 = 14"}
+      ],
+      "model": "gpt-4"
+    }
+    ```
+    """
+    try:
+        body = request.model_dump()
+
+        # Check if inference mode is Chain-of-Thought, if not return error
+        if body.get("inference_mode") != "Chain-of-Thought":
+            raise HTTPException(status_code=400, detail="This endpoint only accepts Chain-of-Thought inference mode")
+
+        body["model"] = (
+            "mrfakename/mistral-small-3.1-24b-instruct-2503-hf" if body.get("model") == "Default" else body.get("model")
+        )
+
+        body["seed"] = int(body.get("seed") or random.randint(0, 1000000))
+
+        uids = (
+            [int(uid) for uid in body.get("uids")]
+            if body.get("uids")
+            else filter_available_uids(
+                task=body.get("task"),
+                model=body.get("model"),
+                test=shared_settings.API_TEST_MODE,
+                n_miners=shared_settings.API_TOP_MINERS_TO_STREAM,
+            )
+        )
+
+        if not uids:
+            raise HTTPException(status_code=500, detail="No available miners")
+
+        # Create a new job
+        job_id = job_store.create_job()
+        job = job_store.get_job(job_id)
+
+        # Create the test time inference request
+        test_time_request = TestTimeInferenceRequest(
+            messages=request.messages,
+            model=request.model,
+            uids=uids,
+            json_format=request.json_format,
+        )
+
+        # Create the orchestrator
+        orchestrator = OrchestratorV2(completions=completions)
+
+        # Add the background task
+        background_tasks.add_task(
+            process_chain_of_thought_job,
+            job_id=job_id,
+            orchestrator=orchestrator,
+            messages=test_time_request.messages,
+            created_at=job.created_at,
+        )
+
+        # Get the job
+        job = job_store.get_job(job_id)
+
+        # Return the job response
+        return JobResponse(
+            job_id=job.job_id,
+            status=job.status,
+            created_at=job.created_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+            updated_at=job.updated_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+
+    except Exception as e:
+        logger.exception(f"Error in creating chain of thought job: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
+@router.get(
+    "/v1/chat/completions/jobs/{job_id}",
+    summary="Get the status and result of a Chain-of-Thought job",
+    description="Retrieve the status and result of a Chain-of-Thought job by its ID.",
+    response_model=JobResultResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Job status and result",
+            "model": JobResultResponse,
+        },
+        status.HTTP_404_NOT_FOUND: {"description": "Job not found"},
+    },
+)
+async def get_chain_of_thought_job(job_id: str, api_key: str = Depends(validate_api_key)):
+    """
+    Get the status and result of a Chain-of-Thought job.
+
+    This endpoint retrieves the status and result of a Chain-of-Thought job by its ID.
+    If the job is completed, the result will be included in the response.
+    If the job failed, the error message will be included in the response.
+
+    ## Path Parameters:
+    - **job_id** (str): The ID of the job to retrieve.
+
+    ## Response:
+    - **job_id** (str): Unique identifier for the job.
+    - **status** (str): Current status of the job (pending, running, completed, failed).
+    - **created_at** (str): Timestamp when the job was created.
+    - **updated_at** (str): Timestamp when the job was last updated.
+    - **result** (List[dict], optional): Result of the job if completed.
+    - **error** (str, optional): Error message if the job failed.
+    """
+    job = job_store.get_job(job_id)
+    logger.info(f"Processing job with id: {job.job_id}, status: {job.status}, created at: {job.created_at}")
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job with ID {job_id} not found")
+
+    return JobResultResponse(
+        job_id=job.job_id,
+        status=job.status,
+        created_at=job.created_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        updated_at=job.updated_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        result=job.result,
+        error=job.error,
     )

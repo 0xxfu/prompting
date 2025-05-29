@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from prompting.llms.apis.gpt_wrapper import LLMMessage, LLMMessages
 from prompting.llms.apis.llm_wrapper import LLMWrapper
-from prompting.llms.model_manager import model_manager
+from prompting.llms.model_manager import ModelManager
 from prompting.llms.model_zoo import ModelConfig
 from shared import settings
 from shared.base import DatasetEntry
@@ -33,16 +33,25 @@ class BaseTask(BaseModel, ABC):
     reference: Any = None
     task_id: str = Field(default_factory=lambda: str(uuid4()), allow_mutation=False)
     organic: bool = False
+    timeout: int = settings.shared_settings.NEURON_TIMEOUT
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @abstractmethod
-    def make_query(self, **kwargs):
+    async def make_query(self, **kwargs):
         raise NotImplementedError("Method make_query must be implemented")
 
     @abstractmethod
     async def make_reference(self, **kwargs):
         raise NotImplementedError("Method make_reference must be implemented")
+
+    @property
+    def request_body(self) -> dict:
+        body = {
+            "task": self.__class__.__name__,
+            "timeout": self.timeout,
+        }
+        return body
 
 
 class BaseTextTask(BaseTask):
@@ -58,7 +67,6 @@ class BaseTextTask(BaseTask):
     augmentation_system_prompt: ClassVar[str | None] = None
     dataset_entry: DatasetEntry | None = None
     sampling_params: dict[str, float] = settings.shared_settings.SAMPLING_PARAMS
-    timeout: int = settings.shared_settings.NEURON_TIMEOUT
     max_tokens: int = settings.shared_settings.NEURON_MAX_TOKENS
     organic: bool = False
 
@@ -72,26 +80,22 @@ class BaseTextTask(BaseTask):
             self.llm_model_id = self.llm_model.llm_model_id if self.llm_model else None
         return self
 
-    def make_query(self, dataset_entry: DatasetEntry, **kwargs) -> str:
+    async def make_query(self, dataset_entry: DatasetEntry, **kwargs) -> str:
         return self.query
 
-    async def make_reference(self, dataset_entry: DatasetEntry) -> str:
+    async def make_reference(self, dataset_entry: DatasetEntry, model_manager: ModelManager | None = None) -> str:
         return self.reference
 
-    def generate_reference(self, messages: list[str]) -> str:
-        """Generates a reference answer to be used for scoring miner completions"""
-        self.reference = model_manager.get_model(settings.shared_settings.LLM_MODEL).generate(
-            messages=messages
-        )  # This should be a list of dict
+    async def generate_reference(self, messages: list[str], model_manager: ModelManager | None = None) -> str:
+        """Generate reference answer to be used for scoring miner completions"""
+        model = await model_manager.get_model(settings.shared_settings.LLM_MODEL[0])
+        self.reference = await model.generate(messages=messages)
         if self.reference is None:
             raise Exception("Reference generation failed")
 
         return self.reference
 
-    def generate_query(
-        self,
-        messages: list[str],
-    ) -> str:
+    async def generate_query(self, messages: list[str]) -> str:
         """Generates a query to be used for generating the challenge"""
         llm_messages = [LLMMessage(role="system", content=self.query_system_prompt)] if self.query_system_prompt else []
         llm_messages.extend([LLMMessage(role="user", content=message) for message in messages])
@@ -118,3 +122,12 @@ class BaseTextTask(BaseTask):
         )
         self.query = challenge
         return challenge
+
+    @property
+    def request_body(self) -> dict:
+        body = super().request_body
+        body["seed"] = self.seed
+        body["sampling_parameters"] = self.sampling_params
+        body["model"] = self.llm_model_id
+        body["messages"] = self.task_messages
+        return body

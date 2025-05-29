@@ -1,4 +1,5 @@
 import sys
+import time
 
 # Need to delete logging from modules and load in standard python logging
 if "logging" in sys.modules:
@@ -14,11 +15,13 @@ from typing import Any, Literal, Optional
 
 import bittensor as bt
 import dotenv
+from bittensor.core.metagraph import Metagraph
+from bittensor.core.subtensor import Subtensor
 from loguru import logger
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
-from shared.misc import cached_property_with_expiration, is_cuda_available
+from shared.misc import is_cuda_available
 
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -28,11 +31,17 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 class SharedSettings(BaseSettings):
     _instance: Optional["SharedSettings"] = None
     _instance_mode: Optional[str] = None
+    _last_metagraph: Metagraph = None
+    _last_update_time: float = 0
+    _block_sync_last_time: float = 0
+    _block_sync_interval: float = 300
+    _subtensor: Subtensor | None = None
 
     mode: Literal["api", "validator", "miner", "mock"] = Field("validator", env="MODE")
     MOCK: bool = False
     NO_BACKGROUND_THREAD: bool = True
     SAVE_PATH: Optional[str] = Field("./storage", env="SAVE_PATH")
+    GEMMA_API_KEY: Optional[str] = Field(None, env="GEMMA_API_KEY")
 
     # W&B.
     WANDB_ON: bool = Field(True, env="WANDB_ON")
@@ -52,10 +61,13 @@ class SharedSettings(BaseSettings):
     # Logging.
     LOGGING_DONT_SAVE_EVENTS: bool = Field(True, env="LOGGING_DONT_SAVE_EVENTS")
     LOG_WEIGHTS: bool = Field(False, env="LOG_WEIGHTS")
+    LOG_TIMINGS: bool = Field(False, env="LOG_TIMINGS")
+    LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
 
     # Neuron parameters.
     NEURON_TIMEOUT: int = Field(20, env="NEURON_TIMEOUT")
-    INFERENCE_TIMEOUT: int = Field(60, env="INFERENCE_TIMEOUT")
+    INFERENCE_TIMEOUT: int = Field(30, env="INFERENCE_TIMEOUT")
+    MAX_TIMEOUT: int = Field(240, env="INFERENCE_TIMEOUT")
     NEURON_DISABLE_SET_WEIGHTS: bool = Field(False, env="NEURON_DISABLE_SET_WEIGHTS")
     NEURON_MOVING_AVERAGE_ALPHA: float = Field(0.1, env="NEURON_MOVING_AVERAGE_ALPHA")
     NEURON_DECAY_ALPHA: float = Field(0.001, env="NEURON_DECAY_ALPHA")
@@ -79,12 +91,14 @@ class SharedSettings(BaseSettings):
     ORGANIC_TRIGGER_FREQUENCY_MIN: int = Field(5, env="ORGANIC_TRIGGER_FREQUENCY_MIN")
     ORGANIC_TRIGGER: str = Field("seconds", env="ORGANIC_TRIGGER")
     ORGANIC_SCALING_FACTOR: int = Field(1, env="ORGANIC_SCALING_FACTOR")
-    TASK_QUEUE_LENGTH_THRESHOLD: int = Field(10, env="TASK_QUEUE_LENGTH_THRESHOLD")
-    SCORING_QUEUE_LENGTH_THRESHOLD: int = Field(10, env="SCORING_QUEUE_LENGTH_THRESHOLD")
+    TASK_QUEUE_LENGTH_THRESHOLD: int = Field(50, env="TASK_QUEUE_LENGTH_THRESHOLD")
+    SCORING_QUEUE_LENGTH_THRESHOLD: int = Field(50, env="SCORING_QUEUE_LENGTH_THRESHOLD")
     HF_TOKEN: Optional[str] = Field(None, env="HF_TOKEN")
     DEPLOY_VALIDATOR: bool = Field(True, env="DEPLOY_VALDITAOR")
-    DEPLOY_SCORING_API: bool = Field(True, env="DEPLOY_SCORING_API")
     SCORING_API_PORT: int = Field(8095, env="SCORING_API_PORT")
+    # Hard-code MC validator axon, since it might be overwritten in the metagraph.
+    MC_VALIDATOR_HOTKEY: str = Field("5Cg5QgjMfRqBC6bh8X4PDbQi7UzVRn9eyWXsB8gkyfppFPPy", env="MC_VALIDATOR_HOTKEY")
+    MC_VALIDATOR_AXON: str = Field("184.105.5.17:42174", env="MC_VALIDATOR_AXON")
 
     # ==== API =====
     # Hotkey used to run api, defaults to Macrocosmos
@@ -94,6 +108,12 @@ class SharedSettings(BaseSettings):
     # Scoring queue threshold when rate-limit start to kick in, used to query validator API with scoring requests.
     SCORING_QUEUE_API_THRESHOLD: int = Field(1, env="SCORING_QUEUE_API_THRESHOLD")
     API_TEST_MODE: bool = Field(False, env="API_TEST_MODE")
+    API_UIDS_EXPLORE: float = Field(0.2, env="API_UIDS_EXPLORE")
+    API_TOP_MINERS_SAMPLE: int = Field(400, env="API_TOP_MINERS_SAMPLE")
+    API_TOP_MINERS_TO_STREAM: int = Field(10, env="API_TOP_MINERS_TO_STREAM")
+    API_MIN_MINERS_TO_SAMPLE: int = Field(50, env="API_MIN_UIDS_TO_SAMPLE")
+    OVERRIDE_AVAILABLE_AXONS: list[str] | None = Field(None, env="OVERRIDE_AVAILABLE_AXONS")
+    API_ENABLE_BALANCE: bool = Field(True, env="API_ENABLE_BALANCE")
 
     # Validator scoring API (.env.validator).
     SCORE_ORGANICS: bool = Field(False, env="SCORE_ORGANICS")
@@ -102,11 +122,11 @@ class SharedSettings(BaseSettings):
     # API Management (.env.api).
     API_PORT: int = Field(8005, env="API_PORT")
     API_HOST: str = Field("0.0.0.0", env="API_HOST")
-    # Validator scoring API address.
+    # Validator scoring API address, also used for miner availabilities.
     # TODO: Choose this dynamically from the network
-    VALIDATOR_API: str = Field("184.105.5.17:8094", env="VALIDATOR_API")  # Used for availability
+    VALIDATOR_API: str = Field("0.0.0.0:8094", env="VALIDATOR_API")
     # Default SN1 API address
-    DEFAULT_SN1_API: str = Field("http://sn1.api.macrocosmos.ai:11198/v1", env="DEFAULT_SN1_API")
+    DEFAULT_SN1_API: str = Field("http://0.0.0.0:8005/v1", env="DEFAULT_SN1_API")
     # File with keys used to access API.
     API_KEYS_FILE: str = Field("api_keys.json", env="API_KEYS_FILE")
     # Admin key used to generate API keys.
@@ -125,16 +145,16 @@ class SharedSettings(BaseSettings):
     )
     TEST_MINER_IDS: list[int] = Field([], env="TEST_MINER_IDS")
     SUBTENSOR_NETWORK: Optional[str] = Field(None, env="SUBTENSOR_NETWORK")
-    MAX_ALLOWED_VRAM_GB: int = Field(62, env="MAX_ALLOWED_VRAM_GB")
-    LLM_MAX_MODEL_LEN: int = Field(4096, env="LLM_MAX_MODEL_LEN")
+    MAX_ALLOWED_VRAM_GB: float = Field(62, env="MAX_ALLOWED_VRAM_GB")
     PROXY_URL: Optional[str] = Field(None, env="PROXY_URL")
-    LLM_MODEL: str = Field("hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4", env="LLM_MODEL")
+    LLM_MODEL: list[str] = [
+        "mrfakename/mistral-small-3.1-24b-instruct-2503-hf",
+    ]
     SAMPLING_PARAMS: dict[str, Any] = {
         "temperature": 0.7,
         "top_p": 0.95,
         "top_k": 50,
-        "max_new_tokens": 512,
-        "do_sample": True,
+        "max_tokens": 512,
     }
     MINER_LLM_MODEL: Optional[str] = Field(None, env="MINER_LLM_MODEL")
     LLM_MODEL_RAM: float = Field(70, env="LLM_MODEL_RAM")
@@ -232,7 +252,7 @@ class SharedSettings(BaseSettings):
             raise ValueError("NETUID must be specified")
         values["TEST"] = netuid != 1
         if values.get("TEST_MINER_IDS"):
-            values["TEST_MINER_IDS"] = str(values["TEST_MINER_IDS"]).split(",")
+            values["TEST_MINER_IDS"] = values["TEST_MINER_IDS"]
         if mode == "mock":
             values["MOCK"] = True
             values["NEURON_DEVICE"] = "cpu"
@@ -243,44 +263,68 @@ class SharedSettings(BaseSettings):
 
     @cached_property
     def WALLET(self):
+        # TODO: Move chain-related stuff out of settings.
         wallet_name = self.WALLET_NAME  # or config().wallet.name
         hotkey = self.HOTKEY  # or config().wallet.hotkey
         logger.info(f"Instantiating wallet with name: {wallet_name}, hotkey: {hotkey}")
         return bt.wallet(name=wallet_name, hotkey=hotkey)
 
     @cached_property
-    def SUBTENSOR(self) -> bt.subtensor:
+    def SUBTENSOR(self) -> Subtensor:
+        """Lazy subtensor initialization."""
+        if self._subtensor is not None:
+            return self._subtensor
+        # TODO: Move chain-related stuff out of settings.
         subtensor_network = self.SUBTENSOR_NETWORK or os.environ.get("SUBTENSOR_NETWORK", "local")
         # bt_config = config()
         if subtensor_network.lower() == "local":
             subtensor_network = os.environ.get("SUBTENSOR_CHAIN_ENDPOINT")  # bt_config.subtensor.chain_endpoint or
         else:
-            subtensor_network = subtensor_network.lower()  # bt_config.subtensor.network or
+            subtensor_network = subtensor_network.lower()
         logger.info(f"Instantiating subtensor with network: {subtensor_network}")
-        return bt.subtensor(network=subtensor_network)
+        self._subtensor = Subtensor(network=subtensor_network)
+        return self._subtensor
 
-    @cached_property_with_expiration(expiration_seconds=1200)
-    def METAGRAPH(self) -> bt.metagraph:
-        logger.info(f"Instantiating metagraph with NETUID: {self.NETUID}")
-        return self.SUBTENSOR.metagraph(netuid=self.NETUID)
+    @property
+    def METAGRAPH(self) -> Metagraph:
+        if time.time() - self._last_update_time > 1200:
+            try:
+                logger.info(f"Fetching new METAGRAPH for NETUID={self.NETUID}")
+                meta = self.SUBTENSOR.metagraph(netuid=self.NETUID)
+                self._last_metagraph = meta
+                self._last_update_time = time.time()
+                return meta
+            except Exception as e:
+                logger.error(f"Failed to fetch new METAGRAPH for NETUID={self.NETUID}: {e}")
+                if self._last_metagraph is not None:
+                    logger.warning("Falling back to the previous METAGRAPH.")
+                    return self._last_metagraph
+                else:
+                    logger.error("No previous METAGRAPH is available; re-raising exception.")
+                    raise
+        else:
+            return self._last_metagraph
 
     @cached_property
     def UID(self) -> int:
+        # TODO: Move chain-related stuff out of settings.
         return self.METAGRAPH.hotkeys.index(self.WALLET.hotkey.ss58_address)
 
-    @cached_property
-    def DENDRITE(self) -> bt.dendrite:
-        logger.info(f"Instantiating dendrite with wallet: {self.WALLET}")
-        return bt.dendrite(wallet=self.WALLET)
+    @property
+    def block(self) -> int:
+        # TODO: Move chain-related stuff out of settings.
+        time_since_last_block = time.time() - self._block_sync_last_time
+        if time_since_last_block > self._block_sync_interval:
+            self._block = self.SUBTENSOR.get_current_block()
+            self._block_sync_last_time = time.time()
+            return self._block
+
+        blocks_passed = time_since_last_block // 12
+        return self._block + blocks_passed
 
 
 try:
-    if is_cuda_available():
-        shared_settings = SharedSettings.load(mode="validator")
-    else:
-        shared_settings = SharedSettings.load(mode="mock")
-    pass
+    shared_settings = SharedSettings.load(mode="validator" if is_cuda_available() else "mock")
 except Exception as e:
     logger.exception(f"Error loading settings: {e}")
     shared_settings = None
-logger.info("Shared settings loaded.")

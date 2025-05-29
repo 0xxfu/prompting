@@ -1,4 +1,5 @@
-import subprocess
+import asyncio
+import functools
 import time
 import traceback
 from functools import lru_cache, update_wrapper
@@ -8,6 +9,19 @@ from typing import Any, Callable
 import bittensor as bt
 
 from shared.exceptions import BittensorError
+
+
+# decorator with options
+def async_lru_cache(*lru_cache_args, **lru_cache_kwargs):
+    def async_lru_cache_decorator(async_function):
+        @functools.lru_cache(*lru_cache_args, **lru_cache_kwargs)
+        def cached_async_function(*args, **kwargs):
+            coroutine = async_function(*args, **kwargs)
+            return asyncio.ensure_future(coroutine)
+
+        return cached_async_function
+
+    return async_lru_cache_decorator
 
 
 class classproperty:
@@ -160,12 +174,10 @@ def cached_property_with_expiration(expiration_seconds=1200):
     return decorator
 
 
-def is_cuda_available():
+def is_cuda_available() -> bool:
     try:
-        # Run nvidia-smi to list available GPUs
-        result = subprocess.run(
-            ["nvidia-smi", "-L"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True
-        )
-        return "GPU" in result.stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        import torch
+
+        return torch.cuda.is_available()
+    except ImportError:
         return False

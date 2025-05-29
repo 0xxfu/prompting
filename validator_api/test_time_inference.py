@@ -8,6 +8,7 @@ from loguru import logger
 
 from prompting.llms.apis.llm_messages import LLMMessage, LLMMessages
 from prompting.llms.apis.llm_wrapper import LLMWrapper
+from shared.prompts.test_time_inference import final_answer_prompt, intro_prompt, system_acceptance_prompt
 from shared.timer import Timer
 from validator_api.chat_completion import chat_completion
 
@@ -37,15 +38,30 @@ def parse_multiple_json(api_response):
             # Replace escaped single quotes with actual single quotes
             json_str_clean = json_str.replace("\\'", "'")
 
+            # Remove or replace invalid control characters
+            json_str_clean = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", json_str_clean)
+
             # Parse the JSON string into a dictionary
             obj = json.loads(json_str_clean)
             parsed_objects.append(obj)
         except json.JSONDecodeError as e:
-            print(f"Failed to parse JSON object: {e}")
-            continue
+            logger.warning(f"Failed to parse JSON object: {e}")
+
+            # Try a more aggressive approach if standard cleaning failed
+            try:
+                clean_str = "".join(c if ord(c) >= 32 or c in ["\n", "\r", "\t"] else " " for c in json_str)
+                clean_str = re.sub(r"\s+", " ", clean_str)  # Normalize whitespace
+
+                # Try to parse again
+                obj = json.loads(clean_str)
+                parsed_objects.append(obj)
+                logger.info("Successfully parsed JSON after aggressive cleaning")
+            except json.JSONDecodeError:
+                # If still failing, log and continue
+                continue
 
     if len(parsed_objects) == 0:
-        logger.error(
+        logger.debug(
             f"No valid JSON objects found in the response - couldn't parse json. The miner response was: {api_response}"
         )
         return None
@@ -54,14 +70,17 @@ def parse_multiple_json(api_response):
         or not parsed_objects[0].get("content")
         or not parsed_objects[0].get("next_action")
     ):
-        logger.error(
+        logger.debug(
             f"Invalid JSON object found in the response - field missing. The miner response was: {api_response}"
         )
         return None
+
     return parsed_objects
 
 
-async def make_api_call(messages, max_tokens, model=None, is_final_answer: bool = False, use_miners: bool = True):
+async def make_api_call(
+    messages, model=None, is_final_answer: bool = False, use_miners: bool = True, uids: list[int] | None = None
+):
     async def single_attempt():
         try:
             if use_miners:
@@ -79,6 +98,7 @@ async def make_api_call(messages, max_tokens, model=None, is_final_answer: bool 
                         "seed": random.randint(0, 1000000),
                     },
                     num_miners=3,
+                    uids=uids,
                 )
                 response_str = response.choices[0].message.content
             else:
@@ -90,7 +110,6 @@ async def make_api_call(messages, max_tokens, model=None, is_final_answer: bool 
                     max_tokens=2000,
                 )
 
-            logger.debug(f"Making API call with\n\nMESSAGES: {messages}\n\nRESPONSE: {response_str}")
             response_dict = parse_multiple_json(response_str)[0]
             return response_dict
         except Exception as e:
@@ -143,73 +162,20 @@ async def make_api_call(messages, max_tokens, model=None, is_final_answer: bool 
         }
 
 
-async def generate_response(original_messages: list[dict[str, str]], model: str = None, use_miners: bool = True):
+async def generate_response(
+    original_messages: list[dict[str, str]], model: str = None, uids: list[int] | None = None, use_miners: bool = True
+):
     messages = [
         {
             "role": "system",
-            "content": """You are a world-class expert in analytical reasoning and problem-solving. Your task is to break down complex problems through rigorous step-by-step analysis, carefully examining each aspect before moving forward. For each reasoning step:
-
-OUTPUT FORMAT:
-Return a JSON object with these required fields:
-{
-    "title": "Brief, descriptive title of current reasoning phase",
-    "content": "Detailed explanation of your analysis",
-    "next_action": "continue" or "final_answer"
-}
-
-REASONING PROCESS:
-1. Initial Analysis
-   - Break down the problem into core components
-   - Identify key constraints and requirements
-   - List relevant domain knowledge and principles
-
-2. Multiple Perspectives
-   - Examine the problem from at least 3 different angles
-   - Consider both conventional and unconventional approaches
-   - Identify potential biases in initial assumptions
-
-3. Exploration & Validation
-   - Test preliminary conclusions against edge cases
-   - Apply domain-specific best practices
-   - Quantify confidence levels when possible (e.g., 90% certain)
-   - Document key uncertainties or limitations
-
-4. Critical Review
-   - Actively seek counterarguments to your reasoning
-   - Identify potential failure modes
-   - Consider alternative interpretations of the data/requirements
-   - Validate assumptions against provided context
-
-5. Synthesis & Refinement
-   - Combine insights from multiple approaches
-   - Strengthen weak points in the reasoning chain
-   - Address identified edge cases and limitations
-   - Build towards a comprehensive solution
-
-REQUIREMENTS:
-- Each step must focus on ONE specific aspect of reasoning
-- Explicitly state confidence levels and uncertainty
-- When evaluating options, use concrete criteria
-- Include specific examples or scenarios when relevant
-- Acknowledge limitations in your knowledge or capabilities
-- Maintain logical consistency across steps
-- Build on previous steps while avoiding redundancy
-
-CRITICAL THINKING CHECKLIST:
-✓ Have I considered non-obvious interpretations?
-✓ Are my assumptions clearly stated and justified?
-✓ Have I identified potential failure modes?
-✓ Is my confidence level appropriate given the evidence?
-✓ Have I adequately addressed counterarguments?
-
-Remember: Quality of reasoning is more important than speed. Take the necessary steps to build a solid analytical foundation before moving to conclusions.""",
+            "content": intro_prompt(),
         }
     ]
     messages += original_messages
     messages += [
         {
             "role": "assistant",
-            "content": "I understand. I will now analyze the problem systematically, following the structured reasoning process while maintaining high standards of analytical rigor and self-criticism.",
+            "content": system_acceptance_prompt(),
         }
     ]
 
@@ -219,12 +185,11 @@ Remember: Quality of reasoning is more important than speed. Take the necessary 
 
     for _ in range(MAX_THINKING_STEPS):
         with Timer() as timer:
-            step_data = await make_api_call(messages, 300, model=model, use_miners=use_miners)
+            step_data = await make_api_call(messages, model=model, use_miners=use_miners, uids=uids)
         thinking_time = timer.final_time
         total_thinking_time += thinking_time
 
         steps.append((f"Step {step_count}: {step_data['title']}", step_data["content"], thinking_time))
-
         messages.append({"role": "assistant", "content": json.dumps(step_data)})
 
         if step_data["next_action"] == "final_answer" or not step_data.get("next_action"):
@@ -236,18 +201,13 @@ Remember: Quality of reasoning is more important than speed. Take the necessary 
     messages.append(
         {
             "role": "user",
-            "content": """Based on your thorough analysis, please provide your final answer. Your response should:
-1. Clearly state your conclusion
-2. Summarize the key supporting evidence
-3. Acknowledge any remaining uncertainties
-4. Include relevant caveats or limitations
-
-Return your answer in the same JSON format as previous steps.""",
+            "content": final_answer_prompt(),
         }
     )
 
     start_time = time.time()
-    final_data = await make_api_call(messages, 200, is_final_answer=True, model=model, use_miners=use_miners)
+    final_data = await make_api_call(messages, model=model, is_final_answer=True, use_miners=use_miners, uids=uids)
+
     end_time = time.time()
     thinking_time = end_time - start_time
     total_thinking_time += thinking_time

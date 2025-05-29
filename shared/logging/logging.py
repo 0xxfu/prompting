@@ -2,9 +2,8 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Literal
 
-import numpy as np
 import wandb
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
@@ -15,9 +14,10 @@ from prompting.rewards.reward import WeightedRewardEvent
 from prompting.tasks.task_registry import TaskRegistry
 from shared import settings
 from shared.dendrite import DendriteResponseEvent
+from shared.logging.serializer_registry import recursive_model_dump
 
 # TODO: Get rid of global variables.
-WANDB: Run
+WANDB: Run | None = None
 
 
 @dataclass
@@ -79,7 +79,7 @@ def should_reinit_wandb():
 
 def init_wandb(reinit=False, neuron: Literal["validator", "miner", "api"] = "validator", custom_tags: list = []):
     """Starts a new wandb run."""
-    global WANDB
+    # global WANDB
     tags = [
         f"Wallet: {settings.shared_settings.WALLET.hotkey.ss58_address}",
         f"Version: {prompting.__version__}",
@@ -111,27 +111,25 @@ def init_wandb(reinit=False, neuron: Literal["validator", "miner", "api"] = "val
     wandb_run_name = f"{neuron}{settings.shared_settings.UID}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     # Initialize the wandb run with the custom name.
-    WANDB = wandb.init(
+    wandb_obj = wandb.init(
         reinit=reinit,
         name=wandb_run_name,
         project=settings.shared_settings.WANDB_PROJECT_NAME,
         entity=settings.shared_settings.WANDB_ENTITY,
         mode="offline" if settings.shared_settings.WANDB_OFFLINE else "online",
-        dir=settings.shared_settings.SAVE_PATH,
         tags=tags,
         notes=settings.shared_settings.WANDB_NOTES,
         config=wandb_config,
     )
-    signature = settings.shared_settings.WALLET.hotkey.sign(WANDB.id.encode()).hex()
+    signature = settings.shared_settings.WALLET.hotkey.sign(wandb_obj.id.encode()).hex()
     wandb_config["SIGNATURE"] = signature
-    WANDB.config.update(wandb_config)
-    logger.success(f"Started a new wandb run <blue> {WANDB.name} </blue>")
+    wandb_obj.config.update(wandb_config)
+    logger.success(f"Started a new wandb run <blue> {wandb_obj.name} </blue>")
 
 
 def reinit_wandb():
     """Reinitializes wandb, rolling over the run."""
-    global WANDB
-    WANDB.finish()
+    wandb.finish()
     init_wandb(reinit=True)
 
 
@@ -156,7 +154,7 @@ class ValidatorLoggingEvent(BaseEvent):
     task_id: str
     forward_time: float | None = None
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, copy_on_model_validation=False)
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __str__(self):
         sample_completions = [completion for completion in self.response_event.completions if len(completion) > 0]
@@ -179,7 +177,7 @@ class RewardLoggingEvent(BaseEvent):
     response_event: DendriteResponseEvent
     reward_events: list[WeightedRewardEvent]
     task_id: str
-    reference: str
+    reference: str | None
     challenge: str | list[dict]
     task: str
     task_dict: dict
@@ -188,16 +186,34 @@ class RewardLoggingEvent(BaseEvent):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __str__(self):
-        rewards = [r.rewards for r in self.reward_events]
-
+        # Return everthing
         return f"""RewardLoggingEvent:
-            Rewards:
-                Rewards: {rewards}
-                Min: {np.min(rewards) if len(rewards) > 0 else None}
-                Max: {np.max(rewards) if len(rewards) > 0 else None}
-                Average: {np.mean(rewards) if len(rewards) > 0 else None}
+            block: {self.block}
+            step: {self.step}
+            response_event: {self.response_event}
+            reward_events: {self.reward_events}
             task_id: {self.task_id}
-            task_name: {self.task}"""
+            task: {self.task}
+            task_dict: {self.task_dict}
+            source: {self.source}
+            reference: {self.reference}
+            challenge: {self.challenge}
+        """
+
+    # Override the model_dump method to return a dictionary like the __str__ method
+    def model_dump(self) -> dict:
+        return {
+            "block": self.block,
+            "step": self.step,
+            "response_event": self.response_event,
+            "reward_events": self.reward_events,
+            "task_id": self.task_id,
+            "task": self.task,
+            "task_dict": self.task_dict,
+            "source": self.source,
+            "reference": self.reference,
+            "challenge": self.challenge,
+        }
 
 
 class MinerLoggingEvent(BaseEvent):
@@ -224,21 +240,8 @@ def log_event(event: BaseEvent):
     if settings.shared_settings.WANDB_ON:
         if should_reinit_wandb():
             reinit_wandb()
-        unpacked_event = unpack_events(event)
-        unpacked_event = convert_arrays_to_lists(unpacked_event)
-        wandb.log(unpacked_event)
-
-
-def unpack_events(event: BaseEvent) -> dict[str, Any]:
-    """reward_events and penalty_events are unpacked into a list of dictionaries."""
-    event_dict = event.model_dump()
-    for key in list(event_dict.keys()):
-        if key == "response_event":
-            nested_dict = event_dict.pop(key)
-            if isinstance(nested_dict, dict):
-                event_dict.update(nested_dict)
-    return event_dict
-
-
-def convert_arrays_to_lists(data: dict) -> dict:
-    return {key: value.tolist() if hasattr(value, "tolist") else value for key, value in data.items()}
+        unpacked_event = recursive_model_dump(event)
+        try:
+            wandb.log(unpacked_event)
+        except BaseException as e:
+            logger.error(f"Error during wandb log {e}: {unpacked_event}")

@@ -17,6 +17,10 @@ def load_api_keys():
         with open(shared_settings.API_KEYS_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
+        logger.error(f"API keys are not found: {shared_settings.API_KEYS_FILE}")
+        return {}
+    except json.JSONDecodeError:
+        logger.exception("JSON decode error when reading API keys")
         return {}
 
 
@@ -27,7 +31,6 @@ def save_api_keys(api_keys):
 
 # Use lifespan to initialize API keys
 _keys = load_api_keys()
-logger.info(f"Loaded API keys: {_keys}")
 
 
 # Dependency to validate the admin key
@@ -36,11 +39,29 @@ def validate_admin_key(admin_key: str = Header(...)):
         raise HTTPException(status_code=403, detail="Invalid admin key")
 
 
-# Dependency to validate API keys
-def validate_api_key(api_key: str = Header(...)):
-    if api_key not in _keys:
-        raise HTTPException(status_code=403, detail="Invalid API key")
-    return _keys[api_key]
+def validate_api_key(
+    api_key: str | None = Header(None),
+    authorization: str | None = Header(None),
+):
+    """
+    1) If 'api_key' header exists (the old style), validate it.
+    2) Else, if 'Authorization' header exists and starts with Bearer, extract token and validate.
+    3) Otherwise, raise a 403.
+    """
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer":
+            raise HTTPException(status_code=403, detail="Invalid authorization scheme")
+        if token not in _keys:
+            raise HTTPException(status_code=403, detail="Invalid API key")
+        return _keys[token]
+
+    if api_key:
+        if api_key not in _keys:
+            raise HTTPException(status_code=403, detail="Invalid API key")
+        return _keys[api_key]
+
+    raise HTTPException(status_code=403, detail="Missing API key")
 
 
 @router.post("/create-api-key/")

@@ -1,9 +1,9 @@
 import time
-from typing import Optional
+from typing import ClassVar, Optional
 
 import numpy as np
 from angle_emb import AnglE
-from pydantic import ConfigDict, model_validator
+from pydantic import ConfigDict
 from scipy import spatial
 
 from prompting.rewards.reward import BaseRewardModel, BatchRewardOutput
@@ -12,29 +12,25 @@ from shared.dendrite import DendriteResponseEvent
 
 shared_settings = settings.shared_settings
 
-MODEL = AnglE.from_pretrained("WhereIsAI/UAE-Large-V1", pooling_strategy="cls", device=shared_settings.NEURON_DEVICE)
-if shared_settings.NEURON_DEVICE.startswith("cuda"):
-    # This line is necessary to pass the model to the device defined at its initialization
-    MODEL = MODEL.cuda()
-
 
 class RelevanceRewardModel(BaseRewardModel):
     threshold: Optional[float] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    embedding_model: Optional[AnglE] = None
+    embedding_model: ClassVar[AnglE] = AnglE.from_pretrained(
+        "WhereIsAI/UAE-Large-V1", pooling_strategy="cls", device=shared_settings.NEURON_DEVICE
+    ).to(shared_settings.NEURON_DEVICE)
 
-    @model_validator(mode="after")
-    def init_model(self) -> "RelevanceRewardModel":
-        self.embedding_model = MODEL
-        return self
-
-    def reward(self, reference: str, response_event: DendriteResponseEvent, **kwargs) -> BatchRewardOutput:
+    async def reward(
+        self, reference: str, response_event: DendriteResponseEvent, model_manager=None, **kwargs
+    ) -> BatchRewardOutput:
         """Calculate the cosine similarity between sentence embeddings of the reference and completions.
 
         We subtract a baseline score which is what an empty string would get (a failed completion).
         This is usually around 0.35. We also clip the rewards between 0 and 1.
         The maximum effective score is around 0.65.
         """
+        if not reference:
+            raise Exception("Reference is empty - something went wrong during the reference generation")
         reference_embedding = self.embedding_model.encode(reference, to_numpy=True)
         reference_emb_flatten = reference_embedding.flatten()
         rewards: list[float] = []

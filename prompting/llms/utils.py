@@ -4,6 +4,9 @@ import numpy as np
 import torch
 from loguru import logger
 
+from prompting.llms.hf_llm import ReproducibleHF
+from prompting.llms.hf_text_image import VLLMTextImageToText
+from prompting.llms.vllm_llm import ReproducibleVLLM
 from shared.misc import classproperty
 
 
@@ -112,3 +115,13 @@ class GPUInfo:
     @classproperty
     def gpu_utilization(cls):
         return cls.used_memory / cls.total_memory
+
+
+TEXT_MODELS = ["mrfakename/mistral-small-3.1-24b-instruct-2503-hf"]
+
+
+def model_factory(model_name: str) -> type[ReproducibleHF]:
+    if model_name in TEXT_MODELS:
+        return ReproducibleVLLM
+    else:
+        return VLLMTextImageToText
